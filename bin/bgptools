@@ -1,0 +1,251 @@
+#!/bin/bash
+#
+# bgptools - CLI tool to fetch BGP information from bgp.tools
+# Usage: bgptools <ip|asn>
+#
+
+set -uo pipefail
+
+VERSION="1.0.0"
+UA="bgptools-cli/$VERSION (https://github.com/olerap/bgptools-cli)"
+BASE="https://bgp.tools"
+
+# Colors
+BOLD='\033[1m'
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+GRAY='\033[0;90m'
+RESET='\033[0m'
+
+usage() {
+    echo "bgptools v$VERSION - Look up BGP information from bgp.tools"
+    echo ""
+    echo "Usage: bgptools <ip-address | AS-number>"
+    echo ""
+    echo "Examples:"
+    echo "  bgptools 1.1.1.1"
+    echo "  bgptools 2606:4700::1111"
+    echo "  bgptools AS13335"
+    echo "  bgptools 13335"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help       Show this help message"
+    echo "  -v, --version    Show version"
+    exit 1
+}
+
+strip_html() {
+    sed 's/<[^>]*>//g' | sed 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&#39;/'"'"'/g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' || true
+}
+
+fetch_page() {
+    curl -s -L -H "User-Agent: $UA" "$1" 2>/dev/null
+}
+
+print_field() {
+    local label="$1"
+    local value="$2"
+    if [[ -n "$value" ]]; then
+        printf "${CYAN}%-24s${RESET} %s\n" "$label:" "$value"
+    fi
+}
+
+print_header() {
+    echo ""
+    echo -e "${BOLD}$1${RESET}"
+    echo "────────────────────────────────────────"
+}
+
+lookup_asn() {
+    local asn="$1"
+    asn="${asn#AS}"
+    asn="${asn#as}"
+
+    local html
+    html=$(fetch_page "$BASE/as/$asn")
+
+    if echo "$html" | grep -q "404 - bgp.tools"; then
+        echo "Error: AS$asn not found on bgp.tools"
+        exit 1
+    fi
+
+    # Name
+    local name
+    name=$(echo "$html" | grep 'id="network-name"' | strip_html | head -1)
+
+    # Meta description
+    local description
+    description=$(echo "$html" | grep 'meta name="description"' | sed 's/.*content="\([^"]*\)".*/\1/' | head -1)
+
+    print_header "AS$asn - $name"
+    echo ""
+
+    if [[ -n "$description" ]]; then
+        echo -e "${GRAY}$description${RESET}"
+        echo ""
+    fi
+
+    # Prefixes originated (inline dd)
+    local prefixes
+    prefixes=$(echo "$html" | grep -A1 '>Prefixes Originated<' | grep '<dd' | strip_html | head -1)
+    print_field "Prefixes originated" "${prefixes:-}"
+
+    # Addresses originated
+    local addr_v4 addr_v6
+    addr_v4=$(echo "$html" | grep -A2 '>Addresses Originated<' | grep 'IPv4' | strip_html | head -1)
+    addr_v6=$(echo "$html" | grep -A3 '>Addresses Originated<' | grep 'IPv6' | strip_html | head -1)
+    [[ -n "${addr_v4:-}" ]] && print_field "IPv4 space" "$addr_v4"
+    [[ -n "${addr_v6:-}" ]] && print_field "IPv6 space" "$addr_v6"
+
+    # Peers, upstreams, downstreams counts
+    local peers_count ups_count downs_info
+    peers_count=$(echo "$html" | grep '#peers' -A1 | grep '<dd' | strip_html | head -1)
+    ups_count=$(echo "$html" | grep '#upstreams' -A2 | grep -v '#upstreams' | strip_html | head -1)
+    downs_info=$(echo "$html" | grep '#downstreams' | sed 's/.*<\/a><\/dt>[[:space:]]*//' | strip_html | head -1)
+    [[ -n "${peers_count:-}" ]] && print_field "Peers" "$peers_count"
+    [[ -n "${ups_count:-}" ]] && print_field "Upstreams" "$ups_count"
+    [[ -n "${downs_info:-}" ]] && print_field "Downstreams" "$downs_info"
+
+    # Tags
+    local tags
+    tags=$(echo "$html" | grep 'class="taglist"' | strip_html | paste -sd', ' - || true)
+    [[ -n "${tags:-}" ]] && print_field "Tags" "$tags"
+
+    # Rankings
+    local ranking_lines
+    ranking_lines=$(echo "$html" | grep 'rankings/' | strip_html)
+    if [[ -n "${ranking_lines:-}" ]]; then
+        echo ""
+        echo -e "${BOLD}Rankings${RESET}"
+        echo "$ranking_lines" | while IFS= read -r line; do
+            echo -e "  ${GREEN}$line${RESET}"
+        done
+    fi
+
+    # Top upstreams from sic0 spans after Upstreams heading
+    local upstreams_block
+    upstreams_block=$(echo "$html" | sed -n '/Upstreams<\/derp>/,/Rankings\|Tags\|heading-medium/p' | grep 'href="/as/' | head -8 || true)
+    if [[ -n "${upstreams_block:-}" ]]; then
+        echo ""
+        echo -e "${BOLD}Top Upstreams${RESET}"
+        echo "$upstreams_block" | while IFS= read -r line; do
+            local asnum asdesc
+            asnum=$(echo "$line" | sed 's/.*>\(AS[0-9]*\)<.*/\1/')
+            asdesc=$(echo "$line" | sed 's/.*<\/a>[[:space:]]*//' | strip_html)
+            if [[ -n "$asdesc" && "$asdesc" != "$asnum" ]]; then
+                printf "  %-10s %s\n" "$asnum" "$asdesc"
+            else
+                echo "  $asnum"
+            fi
+        done
+    fi
+
+    echo ""
+    echo -e "${GRAY}$BASE/as/$asn${RESET}"
+    echo ""
+}
+
+lookup_ip() {
+    local ip="$1"
+    local html
+
+    html=$(fetch_page "$BASE/prefix/$ip")
+
+    # Handle redirect
+    local redirect=""
+    if echo "$html" | grep -q 'Temporary Redirect\|Moved Permanently'; then
+        redirect=$(echo "$html" | grep -o 'href="/prefix/[^"]*"' | head -1 | sed 's/href="//;s/"//')
+        if [[ -n "$redirect" ]]; then
+            html=$(fetch_page "$BASE$redirect")
+        fi
+    fi
+
+    if echo "$html" | grep -q "404 - bgp.tools"; then
+        echo "Error: $ip not found on bgp.tools"
+        exit 1
+    fi
+
+    # Prefix
+    local prefix_name
+    prefix_name=$(echo "$html" | grep 'id="network-name"' | strip_html | head -1)
+
+    # Origin AS info from network-number area
+    local origin_asn="" origin_asname=""
+    local net_num_block
+    net_num_block=$(echo "$html" | grep 'id="network-number"' -A10)
+    origin_asn=$(echo "$net_num_block" | grep 'href="/as/' | sed 's/.*>\(AS[0-9]*\)<.*/\1/' | head -1)
+    origin_asname=$(echo "$net_num_block" | sed 's/<[^>]*>//g' | sed 's/&amp;/\&/g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | grep -v '^AS[0-9]' | grep -vi 'originated\|network-number' | head -1 || true)
+
+    print_header "$ip -> $prefix_name"
+    echo ""
+
+    print_field "Prefix" "$prefix_name"
+    [[ -n "$origin_asn" ]] && print_field "Origin AS" "$origin_asn ${origin_asname:-}"
+
+    # dt/dd fields
+    local registered_on registered_to prefix_status prefix_size
+
+    registered_on=$(echo "$html" | grep -A3 '>Registered on<' | grep '<dd' -A1 | strip_html | head -1)
+    print_field "Registered on" "${registered_on:-}"
+
+    registered_to=$(echo "$html" | grep -A3 '>Registered to<' | grep '<dd' -A1 | strip_html | head -1)
+    print_field "Registered to" "${registered_to:-}"
+
+    prefix_status=$(echo "$html" | grep -A3 '>Prefix status<' | grep '<dd' -A1 | strip_html | head -1)
+    print_field "Prefix status" "${prefix_status:-}"
+
+    prefix_size=$(echo "$html" | grep -A3 '>Size of prefix<' | grep '<dd' -A1 | strip_html | head -1)
+    print_field "Size" "${prefix_size:-}"
+
+    # Upstreams table
+    local has_table
+    has_table=$(echo "$html" | grep -c 'upstreamTable' || true)
+    if [[ "$has_table" -gt 0 ]]; then
+        echo ""
+        echo -e "${BOLD}Upstreams${RESET}"
+        echo "$html" | sed -n '/upstreamTable/,/<\/table>/p' | grep -E '(data-sort=|smallonmobile)' | paste - - 2>/dev/null | while IFS= read -r line; do
+            local asnum asdesc
+            asnum=$(echo "$line" | grep -o 'AS[0-9]*' | head -1)
+            asdesc=$(echo "$line" | sed 's/.*smallonmobile nowrap">\([^<]*\)<.*/\1/' 2>/dev/null | sed 's/&amp;/\&/g')
+            if [[ -n "$asnum" ]]; then
+                if [[ "$asdesc" != "$line" && -n "$asdesc" ]]; then
+                    printf "  %-10s %s\n" "$asnum" "$asdesc"
+                else
+                    echo "  $asnum"
+                fi
+            fi
+        done | head -8
+    fi
+
+    echo ""
+    if [[ -n "$redirect" ]]; then
+        echo -e "${GRAY}$BASE$redirect${RESET}"
+    else
+        echo -e "${GRAY}$BASE/prefix/$ip${RESET}"
+    fi
+    echo ""
+}
+
+# --- Main ---
+
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+case "${1:-}" in
+    -h|--help) usage ;;
+    -v|--version) echo "bgptools v$VERSION"; exit 0 ;;
+esac
+
+input="$1"
+
+if [[ "$input" =~ ^[Aa][Ss][0-9]+$ ]] || { [[ "$input" =~ ^[0-9]+$ ]] && ! [[ "$input" =~ \. ]]; }; then
+    lookup_asn "$input"
+elif [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9] ]] || [[ "$input" =~ : ]]; then
+    lookup_ip "$input"
+else
+    echo "Error: '$input' doesn't look like an IP address or ASN number."
+    echo ""
+    usage
+fi
