@@ -6,13 +6,11 @@
 
 set -uo pipefail
 
-VERSION="1.1.0"
-BASE="https://bgp.tools"
+VERSION="1.1.1"
 
 # Colors
 BOLD='\033[1m'
 CYAN='\033[0;36m'
-GREEN='\033[0;32m'
 GRAY='\033[0;90m'
 RESET='\033[0m'
 
@@ -60,7 +58,7 @@ lookup() {
     if [[ "$input" =~ ^[Aa][Ss]([0-9]+)$ ]]; then
         query="as${BASH_REMATCH[1]}"
         display="AS${BASH_REMATCH[1]}"
-    elif [[ "$input" =~ ^[0-9]+$ ]] && ! [[ "$input" =~ \. ]]; then
+    elif [[ "$input" =~ ^[0-9]+$ ]]; then
         query="as${input}"
         display="AS${input}"
     fi
@@ -131,9 +129,7 @@ esac
 
 input="$1"
 
-if [[ "$input" =~ ^[Aa][Ss][0-9]+$ ]] || { [[ "$input" =~ ^[0-9]+$ ]] && ! [[ "$input" =~ \. ]]; }; then
-    lookup "$input"
-elif [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9] ]] || [[ "$input" =~ : ]]; then
+if [[ "$input" =~ ^[Aa][Ss][0-9]+$ ]] || [[ "$input" =~ ^[0-9]+$ ]] || [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9] ]] || [[ "$input" =~ : ]]; then
     lookup "$input"
 else
     echo "Error: '$input' doesn't look like an IP address or ASN number."
